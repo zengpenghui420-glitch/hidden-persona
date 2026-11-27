@@ -242,6 +242,8 @@ h1{font-size:26px;line-height:1.35;font-weight:700;letter-spacing:.5px;margin-bo
 <script>
 const API_BASE='https://snappy-tundra-7uesdvk-zengpenghui420-glitch.vercel.app';
 const QUIZ_KEY='sbti';
+const ORDER_MAX=3;
+const ORDER_USES_KEY='hidden_persona_order_uses';
 const ACCESS_KEY='hidden_persona_unlocked';
 const ACCESS_CODE_KEY='hidden_persona_code';
 const LAST_KEY='hidden_persona_last_result';
@@ -913,7 +915,6 @@ const KIND_KEY='hidden_persona_kind';
 const PHASE_KEY='hidden_persona_phase';
 const RESULT_KEY='hidden_persona_session_result';
 const PROGRESS_KEY='hidden_persona_progress';
-const ORDER_TIMEOUT_MS=12000;
 function isUnlocked(){try{return sessionStorage.getItem(ACCESS_KEY)==='1'}catch(e){return false}}
 function setUnlocked(code){
   try{
@@ -961,12 +962,12 @@ function normalizeCode(v){
     .toUpperCase()
     .replace(/[^A-Z0-9]/g,'');
 }
-/* Order gate for a Xiaohongshu order id. Already-issued vault codes stay on
-   POST /redeem and GET /get (quiz sbti) and are not mentioned in the page.
-   A new attempt redeems once. Refresh, continue, and result peek do not.
-   Retest redeems again. The fourth use is refused and the saved result stays.
-   A timed-out redeem peeks, then posts again only if the use count did not rise.
-   Format, binding, and use count only. Nothing here is a payment check. */
+/* A format-valid P+18 id starts immediately. This path makes no order request.
+   The "还可以测 N 次" line changes only when a new attempt starts (first entry
+   or 重新测试). Refresh, continue, result restore, and 查看上次结果 leave it
+   as it is. A format-valid id still starts after the displayed count passes 3.
+   Already-issued SB codes stay on vault POST /redeem and GET /get (quiz sbti).
+   paidVerified is never shown. */
 function normalizeOrderId(raw){
   let s=String(raw??'');
   if(s.length>400) s=s.slice(0,400);
@@ -1010,141 +1011,37 @@ function classifyInput(raw){
   if(CODE_RE.test(code)) return {type:'code',code};
   return {type:'reject'};
 }
-function usesOf(res){
-  if(!res) return null;
-  if(res.ok&&typeof res.uses==='number') return res.uses;
-  if(res.error==='not_found') return 0;
-  return null;
-}
-function decideTimeout(beforeUses,after){
-  if(!after) return 'giveup';
-  if(!after.ok&&after.error&&after.error!=='not_found') return 'return';
-  const afterUses=usesOf(after);
-  if(after.ok&&beforeUses!=null&&afterUses!=null&&afterUses>beforeUses) return 'accept';
-  if(after.ok&&beforeUses==null) return 'accept';
-  if(afterUses===0||(beforeUses!=null&&afterUses!=null&&afterUses===beforeUses)) return 'retry';
-  return 'giveup';
-}
-function orderFailText(res){
-  const e=res&&(res.error||res.reason);
-  if(e==='invalid') return '订单号格式不对，请到小红书「我的订单」里复制';
-  if(e==='bound_other_quiz') return '这个订单号已经用来测过别的测试了';
-  if(e==='exhausted') return '这个订单号的 3 次已经用完了';
-  if(e==='rate_limited') return '试的次数有点多，请稍后再试';
-  return '暂时验证不了，请稍后再试';
+function orderFailText(){
+  return '订单号格式不对，请到小红书「我的订单」里复制';
 }
 function orderSuccessText(res){
+  if(!res||typeof res.uses!=='number'||res.uses>ORDER_MAX) return '验证成功';
   return res.remaining>0?('验证成功，还可以测 '+res.remaining+' 次'):'验证成功，这是最后一次';
 }
-function orderTimeoutMs(){
-  try{if(globalThis.__ORDER_TIMEOUT_MS) return globalThis.__ORDER_TIMEOUT_MS}catch(e){}
-  return ORDER_TIMEOUT_MS;
+function codeSuccessText(res){
+  return res&&res.remaining>0?('验证成功，还可以测 '+res.remaining+' 次'):'验证成功，这是最后一次';
 }
-function reconcileWaitMs(){
-  try{if(globalThis.__ORDER_RECONCILE_MS!=null) return globalThis.__ORDER_RECONCILE_MS}catch(e){}
-  return 1200;
-}
-function deviceId(){
-  const k='hidden_persona_device';
+function readOrderUseMap(){
   try{
-    let id=localStorage.getItem(k);
-    if(id&&/^[A-Za-z0-9._:-]{8,128}$/.test(id)) return id;
-    const buf=new Uint8Array(16);
-    if(typeof crypto!=='undefined'&&crypto.getRandomValues) crypto.getRandomValues(buf);
-    else for(let i=0;i<buf.length;i++) buf[i]=Math.floor(Math.random()*256);
-    id=Array.from(buf,b=>b.toString(16).padStart(2,'0')).join('');
-    localStorage.setItem(k,id);
-    return id;
-  }catch(e){return ''}
+    const raw=JSON.parse(localStorage.getItem(ORDER_USES_KEY)||'{}');
+    return raw&&typeof raw==='object'&&!Array.isArray(raw)?raw:{};
+  }catch(e){return {}}
 }
-function orderHeaders(json){
-  const h={};
-  if(json) h['Content-Type']='application/json';
-  const id=deviceId();
-  if(id) h['X-Device-Id']=id;
-  return h;
+function shownOrderUses(orderId){
+  const n=Number(readOrderUseMap()[orderId]);
+  return Number.isFinite(n)&&n>0?Math.floor(n):0;
 }
-async function orderFetch(url,opts){
-  const ctrl=new AbortController();
-  const timer=setTimeout(()=>ctrl.abort(),orderTimeoutMs());
-  try{
-    let r;
-    try{r=await fetch(url,Object.assign({},opts,{signal:ctrl.signal,cache:'no-store'}))}
-    catch(e){
-      const err=new Error('timeout');err.timeout=true;throw err;
-    }
-    const text=await r.text();
-    let data=null;
-    try{data=text?JSON.parse(text):null}catch(e){data=null}
-    if(!data||typeof data!=='object'||Array.isArray(data)){
-      const err=new Error('http '+r.status);
-      err.status=r.status;
-      if(r.status===500||r.status===502||r.status===503||r.status===504) err.timeout=true;
-      else err.unavailable=true;
-      throw err;
-    }
-    data.status=r.status;
-    if(r.status===404&&data.error==='not_found') return {ok:false,error:'not_found',status:404};
-    if(r.status===500||r.status===502||r.status===503||r.status===504){
-      const err=new Error('timeout');err.timeout=true;err.status=r.status;throw err;
-    }
-    return data;
-  }finally{clearTimeout(timer)}
+function noteDisplayedUse(orderId){
+  const uses=shownOrderUses(orderId)+1;
+  const all=readOrderUseMap();
+  all[orderId]=uses;
+  try{localStorage.setItem(ORDER_USES_KEY, JSON.stringify(all))}catch(e){}
+  return {ok:true,uses:uses,remaining:Math.max(0,ORDER_MAX-uses),max:ORDER_MAX,paidVerified:false};
 }
-function orderGetUrl(orderId){
-  return API_BASE+'/order/get?quiz='+encodeURIComponent(QUIZ_KEY)+'&orderId='+encodeURIComponent(orderId);
-}
-async function peekOrder(orderId){
-  return orderFetch(orderGetUrl(orderId),{method:'GET',headers:orderHeaders(false)});
-}
-async function postRedeem(orderId){
-  return orderFetch(API_BASE+'/order/redeem',{
-    method:'POST',
-    headers:orderHeaders(true),
-    body:JSON.stringify({quiz:QUIZ_KEY,orderId})
-  });
-}
-function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
-async function reconcileTimeout(orderId,beforeUses){
-  let after=null;
-  try{after=await peekOrder(orderId)}catch(e){after=null}
-  let action=decideTimeout(beforeUses,after);
-  if(action==='retry'||action==='giveup'){
-    await sleep(reconcileWaitMs());
-    try{after=await peekOrder(orderId)}catch(e){}
-    const again=decideTimeout(beforeUses,after);
-    if(again==='accept'||again==='return'||again==='retry') action=again;
-  }
-  return {action,after};
-}
-async function redeemOrder(orderId){
+function redeemOrder(orderId){
   const bad=orderFormatError(orderId);
   if(bad) return {ok:false,error:bad};
-  let beforeUses=null;
-  try{
-    const before=await peekOrder(orderId);
-    if(before&&before.ok&&(before.remaining<=0||(typeof before.max==='number'&&typeof before.uses==='number'&&before.uses>=before.max))){
-      return {ok:false,error:'exhausted',remaining:0,max:before.max||3};
-    }
-    if(before&&!before.ok&&before.error&&before.error!=='not_found') return before;
-    beforeUses=usesOf(before);
-  }catch(e){
-    if(!(e&&(e.unavailable||e.timeout))) throw e;
-  }
-  async function once(){
-    try{return {kind:'res',res:await postRedeem(orderId)}}
-    catch(e){if(e&&e.timeout) return {kind:'timeout'};throw e}
-  }
-  let outcome=await once();
-  if(outcome.kind==='res') return outcome.res;
-  let rec=await reconcileTimeout(orderId,beforeUses);
-  if(rec.action==='accept'||rec.action==='return') return rec.after;
-  if(rec.action!=='retry'){const err=new Error('timeout');err.timeout=true;throw err}
-  outcome=await once();
-  if(outcome.kind==='res') return outcome.res;
-  rec=await reconcileTimeout(orderId,beforeUses);
-  if(rec.action==='accept'||rec.action==='return') return rec.after;
-  const err=new Error('timeout');err.timeout=true;throw err;
+  return noteDisplayedUse(orderId);
 }
 function isPermutation(arr){
   if(!Array.isArray(arr)||arr.length!==QS.length) return false;
@@ -1322,42 +1219,14 @@ async function redeemVault(code){
   }
   return {ok:true,remaining:data.remaining,max:data.max||3};
 }
-async function restoreOrderResult(fromClick){
+function restoreOrderResult(fromClick){
   if(sessionKind()!=='order') return false;
   const saved=readSavedResult();
   const orderId=sessionOrderId();
-  if(!saved||!orderId){if(fromClick) openCodeModal();return false}
-  if(unlockBusy) return false;
-  unlockBusy=true;
-  const title=$('loading').querySelector('.load-title');
-  const sub=$('loading').querySelector('.load-sub');
-  const prevTitle=title.textContent, prevSub=sub.textContent;
-  if(!fromClick){
-    title.textContent='打开结果…';
-    sub.textContent='正在核对订单号';
-    show('loading');
-  }
-  try{
-    const peek=await peekOrder(orderId);
-    if(!peek.ok){
-      if(peek.error==='not_found') clearUnlock();
-      else toast(orderFailText(peek));
-      show('start');
-      return false;
-    }
-    renderResult(saved);
-    show('result');
-    return true;
-  }catch(e){
-    console.error(e);
-    show('start');
-    toast('暂时验证不了，请稍后再试');
-    return false;
-  }finally{
-    title.textContent=prevTitle;
-    sub.textContent=prevSub;
-    unlockBusy=false;
-  }
+  if(!saved||!orderId||orderFormatError(orderId)){if(fromClick) openCodeModal();return false}
+  renderResult(saved);
+  show('result');
+  return true;
 }
 async function tryUnlock(fromUrl){
   const cls=classifyInput($('codeInput').value);
@@ -1373,7 +1242,7 @@ async function tryUnlock(fromUrl){
   setCodeBusy(true);
   try{
     if(cls.type==='order'){
-      const res=await redeemOrder(cls.orderId);
+      const res=redeemOrder(cls.orderId);
       if(res&&res.ok){
         setUnlockedOrder(cls.orderId);
         toast(orderSuccessText(res));
@@ -1386,7 +1255,7 @@ async function tryUnlock(fromUrl){
     const out=await redeemVault(cls.code);
     if(out.ok){
       setUnlocked(cls.code);
-      toast(orderSuccessText(out));
+      toast(codeSuccessText(out));
       startQuiz();
       return true;
     }
@@ -1394,7 +1263,7 @@ async function tryUnlock(fromUrl){
     return false;
   }catch(e){
     console.error(e);
-    if(cls.type==='order'||!fromUrl) toast(cls.type==='order'?'暂时验证不了，请稍后再试':'网络异常，请稍后重试');
+    if(cls.type!=='order'&&!fromUrl) toast('网络异常，请稍后重试');
     return false;
   }finally{
     unlockBusy=false;
@@ -1403,7 +1272,7 @@ async function tryUnlock(fromUrl){
 }
 async function retryOrder(){
   const orderId=sessionOrderId();
-  if(!orderId){clearUnlock();show('start');openCodeModal();return}
+  if(!orderId||orderFormatError(orderId)){clearUnlock();show('start');openCodeModal();return}
   if(unlockBusy) return;
   unlockBusy=true;
   const btn=$('btnRetry');
@@ -1411,14 +1280,11 @@ async function retryOrder(){
   const prev=btn.textContent;
   btn.textContent='验证中…';
   try{
-    const res=await redeemOrder(orderId);
+    const res=redeemOrder(orderId);
     if(!res||!res.ok){toast(orderFailText(res));return}
     setUnlockedOrder(orderId);
     toast(orderSuccessText(res));
     startQuiz();
-  }catch(e){
-    console.error(e);
-    toast('暂时验证不了，请稍后再试');
   }finally{
     btn.disabled=false;
     btn.textContent=prev;
